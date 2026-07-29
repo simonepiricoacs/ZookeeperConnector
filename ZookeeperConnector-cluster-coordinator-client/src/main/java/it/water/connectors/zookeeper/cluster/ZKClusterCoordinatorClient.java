@@ -45,6 +45,18 @@ public class ZKClusterCoordinatorClient implements ClusterCoordinatorClient, Clu
     private CuratorCacheListener clusterCacheListener;
     private Map<String, ClusterNodeInfo> peers;
     private boolean started;
+    /**
+     * The thread performing the current (asynchronous) cluster registration, kept so that an
+     * unregister can wait for it instead of racing it. Volatile: written by the caller of
+     * {@code registerToCluster}, read by whoever shuts the node down.
+     */
+    private volatile Thread registrationThread;
+
+    /**
+     * How long an unregister waits for an in-flight registration. Generous for the normal case (node
+     * created in milliseconds) and short enough not to stall a shutdown.
+     */
+    private static final long REGISTRATION_JOIN_TIMEOUT_MS = 5_000L;
 
     public ZKClusterCoordinatorClient() {
         this.peers = new HashMap<>();
@@ -67,12 +79,16 @@ public class ZKClusterCoordinatorClient implements ClusterCoordinatorClient, Clu
 
     @Override
     public void onConnectionClosed() {
+        //the peer node must be deleted while the connection is still usable: closing the cache first
+        //left the delete to fail silently, so an orderly shutdown kept the node visible to the other
+        //peers until its ZooKeeper session expired (session.timeout.ms, 30s by default) - long enough
+        //for the cluster to keep routing work to a node that is already gone
+        this.unregisterToCluster();
         this.started = false;
         this.unsubscribeToClusterEvents(this);
         //Disconnects from zookeeper
         this.clusterCuratorCache.listenable().removeListener(clusterCacheListener);
         this.clusterCuratorCache.close();
-        this.unregisterToCluster();
     }
 
     @Override
@@ -138,12 +154,17 @@ public class ZKClusterCoordinatorClient implements ClusterCoordinatorClient, Clu
                 logger.warn("Cluster is not started yet! please check your configuration!");
             }
         });
+        this.registrationThread = thread;
         thread.start();
         return true;
     }
 
     @Override
     public boolean unregisterToCluster() {
+        //a registration in flight must be allowed to finish first: it creates the ephemeral node from
+        //its own thread, so deleting before it completes deletes nothing and the node is created right
+        //after - surviving until the session expires. Waiting here makes the two ordered.
+        awaitPendingRegistration();
         return Boolean.TRUE.equals(doClusterOperation(() -> {
             try {
                 this.zookeeperConnectorSystemApi.delete(zookeeperConnectorSystemApi.getPeerPath(clusterNodeOptions.getNodeId()));
@@ -153,6 +174,30 @@ public class ZKClusterCoordinatorClient implements ClusterCoordinatorClient, Clu
             }
             return false;
         }));
+    }
+
+    /**
+     * Joins the registration thread, if one is still running, so that an unregister can never overtake
+     * the create it is supposed to undo.
+     * <p>
+     * Bounded by {@link #REGISTRATION_JOIN_TIMEOUT_MS} rather than by the registration's own 30s
+     * connection budget: in the normal case the node is created in milliseconds, and a shutdown must not
+     * hang waiting for a connection that is evidently not coming. If the wait does expire the delete is
+     * attempted anyway - same behaviour as before, no worse.
+     */
+    private void awaitPendingRegistration() {
+        Thread pending = this.registrationThread;
+        if (pending == null || !pending.isAlive()) {
+            return;
+        }
+        try {
+            pending.join(REGISTRATION_JOIN_TIMEOUT_MS);
+            if (pending.isAlive()) {
+                logger.warn("Cluster registration still in flight after {}ms, unregistering anyway", REGISTRATION_JOIN_TIMEOUT_MS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void registerClusterEventListener() {

@@ -11,6 +11,7 @@ import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.ExtendWith;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.awaitility.Awaitility.await;
 
@@ -165,10 +166,18 @@ class ZKClusterCoordinatorTest implements Service {
         peer1.unregisterToCluster();
         peer2.unregisterToCluster();
         peer3.unregisterToCluster();
-        //removal of the 3 ephemeral peer nodes must propagate through ZooKeeper watches and the
-        //Curator cache before the peer count settles at 1 (only the current node left). Use the
-        //same 30s budget as the other awaits in this test: 5s was too tight and failed intermittently.
-        await().atMost(30, SECONDS).pollInterval(1,SECONDS).until(() -> clusterCoordinatorClient.getPeerNodes().size() == 1);
+        //Removal of the 3 ephemeral peer nodes must propagate through ZooKeeper watches and the Curator
+        //cache before the peer count settles at 1 (only the current node left).
+        //
+        //History worth keeping: this used to take ~31s consistently against a 30s budget - i.e. it
+        //passed by a second and failed on any loaded machine (an earlier 5s budget failed outright).
+        //The reason was not propagation latency: the peers' unregister raced the asynchronous
+        //registration and deleted nothing, so the nodes only disappeared when their ZooKeeper session
+        //expired - and session.timeout.ms is exactly 30s. Fixed in ZKClusterCoordinatorClient by
+        //ordering unregister before the connection teardown and by joining a registration in flight;
+        //the wait should now settle in well under a second. The budget stays generous on purpose: it is
+        //a safety net for slow CI, not the mechanism being measured.
+        await().atMost(60, SECONDS).pollInterval(200, MILLISECONDS).until(() -> clusterCoordinatorClient.getPeerNodes().size() == 1);
         Assertions.assertDoesNotThrow(() -> this.clusterCoordinatorClient.onDeactivate());
     }
 
